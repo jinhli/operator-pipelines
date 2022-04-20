@@ -30,6 +30,9 @@ spec:
     - name: pipeline_image
       description: An image of operator-pipeline-images.
       default: "quay.io/redhat-isv/operator-pipelines-images:released"
+    - name: metrics_endpoint
+      description: Prometheus metrics endpoint
+      default: http://pipeline-metrics.pipeline-metrics-prod
     # Kubernetes secrets related params, usually with default values
     - name: github_token_secret_name
       description: The name of the Kubernetes Secret that contains the GitHub token.
@@ -70,9 +73,6 @@ spec:
       description: >-
         The key within the Kubernetes Secret that contains the kerberos keytab for submitting IIB builds.
       default: krb5.keytab
-    - name: metrics_endpoint
-      description: Prometheus metrics endpoint
-      default: http://pipeline-metrics.pipeline-metrics-prod
     - name: signing_pub_secret_name
       description: The name of the Kubernetes Secret that contains the public key for verifying signatures.
       default: signing-pub-key
@@ -423,6 +423,86 @@ spec:
         - name: kerberos_keytab_secret_key
           value: "$(params.kerberos_keytab_secret_key)"
 
+    # use manifest list digests from IIB output and get the manifest digests from registry
+    - name: get-manifest-digests
+      runAfter:
+        - publish-bundle
+      taskRef:
+        name: get-manifest-digests
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: manifest_list_digests
+          value: "$(tasks.publish-bundle.results.manifest_list_digests)"
+        - name: environment
+          value: "$(params.env)"
+      workspaces:
+        - name: registry-credentials
+          workspace: registry-credentials
+
+    # send UMB message for RADAS to sign the container image
+    - name: request-signature
+      runAfter:
+        - get-manifest-digests
+      taskRef:
+        name: request-signature
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: manifest_digest
+          value: "$(tasks.get-manifest-digests.results.manifest_digests)"
+        - name: reference
+          value: "$(tasks.get-manifest-digests.results.docker_references)"
+        - name: requester
+          value: "amisstea"
+        - name: sig_key_id
+          value: "$(tasks.set-env.results.sig_key_id)"
+        - name: sig_key_name
+          value: "$(tasks.set-env.results.sig_key_name)"
+        - name: umb_ssl_secret_name
+          value: "$(params.pyxis_ssl_secret_name)"
+        - name: umb_ssl_cert_secret_key
+          value: "$(params.pyxis_ssl_cert_secret_key)"
+        - name: umb_ssl_key_secret_key
+          value: "$(params.pyxis_ssl_key_secret_key)"
+        - name: umb_client_name
+          value: "$(tasks.set-env.results.umb_client_name)"
+        - name: umb_url
+          value: "$(tasks.set-env.results.umb_url)"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: signing
+
+    - name: upload-signature
+      runAfter:
+        - request-signature
+      taskRef:
+        name: upload-signature
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: signature_data_file
+          value: "$(tasks.request-signature.results.signature_data_file)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pyxis_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pyxis_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pyxis_ssl_key_secret_key)"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: signing_pub_secret_name
+          value: "$(params.signing_pub_secret_name)"
+        - name: signing_pub_secret_key
+          value: "$(params.signing_pub_secret_key)"
+        - name: verify_signature
+          value: "true"
+      workspaces:
+        - name: source
+          workspace: repository
+          subPath: signing
+
     # Publish Vendor, Repository
     - name: publish-resources
       runAfter:
@@ -464,11 +544,15 @@ spec:
           value: "$(tasks.certification-project-check.results.certification_project_id)"
         - name: bundle_version
           value: "$(tasks.bundle-path-validation.results.bundle_version)"
+        - name: git_pr_url
+          value: $(params.git_pr_url)
         - name: package_name
           value: "$(tasks.bundle-path-validation.results.package_name)"
         - name: pyxis_url
           value: "$(tasks.set-env.results.pyxis_url)"
         - name: pipeline_name
+          value: "$(context.pipeline.name)"
+        - name: pipelinerun_name
           value: "$(context.pipelineRun.name)"
         - name: pyxis_ssl_secret_name
           value: "$(params.pyxis_ssl_secret_name)"
