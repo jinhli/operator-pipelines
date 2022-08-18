@@ -18,12 +18,17 @@ spec:
       description: URL to the pull request
     - name: is_latest
       description: If explicitly set to "true", resulting image will be tagged as "latest"
-    - name: registry
-      description: temporary registry used by Hosted pipeline to pass the image to Release pipeline.
+    - name: src_registry
+      description: Source registry for the bundle image.
       default: quay.io
-    - name: image_namespace
-      description: The namespace/organization where images from Hosted pipeline are stored.
+    - name: dest_registry
+      description: Destination registry for the bundle image.
+      default: quay.io
+    - name: src_image_namespace
+      description: The namespace/organization where the bundle image from the Hosted pipeline is stored.
       default: $(context.pipelineRun.namespace)
+    - name: dest_image_namespace
+      description: The namespace/organization where the bundle image will be copied/released.
     - name: env
       description: Which environment to run in. Can be one of [dev, qa, stage, prod]
       default: "prod"
@@ -40,12 +45,6 @@ spec:
     - name: github_token_secret_key
       description: The key within the Kubernetes Secret that contains the GitHub token.
       default: github_bot_token
-    - name: ibm_webhook_token_secret_name
-      description: The name of the Kubernetes Secret that contains the IBM webhook token.
-      default: ibm-webhook-token
-    - name: ibm_webhook_token_secret_key
-      description: The key within the Kubernetes Secret that contains the IBM webhook token.
-      default: token
     - name: pyxis_ssl_secret_name
       description: Kubernetes secret name that contains the Pyxis SSL files.
       default: operator-pipeline-api-certs
@@ -84,7 +83,9 @@ spec:
     - name: results
     - name: ssh-dir
       optional: true
-    - name: registry-credentials
+    - name: registry-pull-credentials
+    - name: registry-push-credentials
+    - name: registry-serve-credentials
     - name: image-data
 
   tasks:
@@ -299,14 +300,58 @@ spec:
         kind: Task
       params:
         - name: image
-          value: &bundleImage "$(params.registry)/$(params.image_namespace)/$(tasks.bundle-path-validation.results.package_name):$(tasks.bundle-path-validation.results.bundle_version)"
+          value: &srcBundleImage "$(params.src_registry)/$(params.src_image_namespace)/$(tasks.bundle-path-validation.results.package_name):$(tasks.bundle-path-validation.results.bundle_version)"
         - name: registry
-          value: $(params.registry)
+          value: $(params.src_registry)
       workspaces:
         - name: registry-credentials
-          workspace: registry-credentials
+          workspace: registry-pull-credentials
         - name: image-data
           workspace: image-data
+
+    - name: copy-bundle-image-to-released-registry
+      runAfter:
+        - get-vendor-related-data
+      taskRef:
+        name: copy-image
+      params:
+        - name: src_image
+          value: *srcBundleImage
+        - name: dest_image
+          value: &destBundleImage "$(params.dest_registry)/$(params.dest_image_namespace)/$(tasks.certification-project-check.results.certification_project_id):$(tasks.bundle-path-validation.results.bundle_version)"
+      workspaces:
+        - name: src-registry-credentials
+          workspace: registry-pull-credentials
+        - name: dest-registry-credentials
+          workspace: registry-push-credentials
+
+    - name: set-cert-project-repository
+      runAfter:
+        - copy-bundle-image-to-released-registry
+      taskRef:
+        name: set-cert-project-repository
+      params:
+        - name: pipeline_image
+          value: "$(params.pipeline_image)"
+        - name: cert_project_id
+          value: "$(tasks.certification-project-check.results.certification_project_id)"
+        - name: registry
+          value: "$(params.dest_registry)"
+        - name: repository
+          value: "$(params.dest_image_namespace)/$(tasks.certification-project-check.results.certification_project_id)"
+        - name: docker_config_file_name
+          value: ".dockerconfigjson"
+        - name: pyxis_url
+          value: "$(tasks.set-env.results.pyxis_url)"
+        - name: pyxis_ssl_secret_name
+          value: "$(params.pyxis_ssl_secret_name)"
+        - name: pyxis_ssl_cert_secret_key
+          value: "$(params.pyxis_ssl_cert_secret_key)"
+        - name: pyxis_ssl_key_secret_key
+          value: "$(params.pyxis_ssl_key_secret_key)"
+      workspaces:
+        - name: registry-credentials
+          workspace: registry-serve-credentials
 
     # Publish image to OCP registry
     - name: publish-to-ocp-registry
@@ -322,7 +367,7 @@ spec:
         - name: repository_name
           value: "$(tasks.get-cert-project-related-data.results.repo_name)"
         - name: image
-          value: *bundleImage
+          value: *srcBundleImage
         - name: is_latest
           value: "$(params.is_latest)"
         - name: bundle_version
@@ -334,39 +379,10 @@ spec:
         - name: ocp_registry_kubeconfig_secret_key
           value: "$(params.ocp_registry_kubeconfig_secret_key)"
 
-    # Trigger IBM webhook for marketplace replication
-    - name: trigger-marketplace-replication
-      runAfter:
-        - publish-to-ocp-registry
-        - get-supported-versions
-        - bundle-path-validation
-      taskRef:
-        name: trigger-marketplace-replication
-      params:
-        - name: bundle_path
-          value: "$(tasks.get-bundle-path.results.bundle_path)"
-        - name: ibm_webhook_token_secret_name
-          value: "$(params.ibm_webhook_token_secret_name)"
-        - name: ibm_webhook_token_secret_key
-          value: "$(params.ibm_webhook_token_secret_key)"
-        - name: package
-          value: "$(tasks.bundle-path-validation.results.package_name)"
-        - name: pipeline_image
-          value: "$(params.pipeline_image)"
-        - name: ocp_version
-          value: "$(tasks.get-supported-versions.results.ocp_version)"
-        - name: organization
-          value: "$(tasks.get-organization.results.organization)"
-        - name: version
-          value: "$(tasks.bundle-path-validation.results.bundle_version)"
-      workspaces:
-        - name: source
-          workspace: repository
-          subPath: src
-
     # create container image
     - name: create-container-image
       runAfter:
+        - set-cert-project-repository
         - publish-to-ocp-registry
         - inspect-image
       taskRef:
@@ -402,7 +418,12 @@ spec:
     - name: publish-bundle
       runAfter:
         - create-container-image
-        - trigger-marketplace-replication
+        - get-supported-versions
+      when: &whenNotUndistributed
+        - input: &operatorDistribution "$(tasks.get-cert-project-related-data.results.operator_distribution)"
+          operator: notin
+          values:
+            - undistributed
       taskRef:
         name: publish-bundle
       params:
@@ -413,7 +434,7 @@ spec:
         - name: bundle_pullspec
           value: "$(tasks.publish-to-ocp-registry.results.image_pullspec)"
         - name: operator_distribution_method
-          value: "$(tasks.get-cert-project-related-data.results.operator_distribution)"
+          value: *operatorDistribution
         - name: iib_url
           value: "$(tasks.set-env.results.iib_url)"
         - name: environment
@@ -427,6 +448,7 @@ spec:
     - name: get-manifest-digests
       runAfter:
         - publish-bundle
+      when: *whenNotUndistributed
       taskRef:
         name: get-manifest-digests
       params:
@@ -438,12 +460,13 @@ spec:
           value: "$(params.env)"
       workspaces:
         - name: registry-credentials
-          workspace: registry-credentials
+          workspace: registry-pull-credentials
 
     # send UMB message for RADAS to sign the container image
     - name: request-signature
       runAfter:
         - get-manifest-digests
+      when: *whenNotUndistributed
       taskRef:
         name: request-signature
       params:
@@ -477,6 +500,7 @@ spec:
     - name: upload-signature
       runAfter:
         - request-signature
+      when: *whenNotUndistributed
       taskRef:
         name: upload-signature
       params:
