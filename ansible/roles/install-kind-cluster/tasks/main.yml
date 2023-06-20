@@ -20,7 +20,18 @@
         - clean
         - install
 
-    - name: "Install cluster '{{ kind_cluster_name }}'"
+    - name: "Set 'kind_cluster_api_server_address' from ip['{{ kind_cluster_api_ip_index }}']"
+      ansible.builtin.set_fact:
+        kind_cluster_api_server_address: "{{ ansible_facts['all_ipv4_addresses'][kind_cluster_api_ip_index | int] }}"
+      when:
+        - kind_cluster_api_ip_index is defined
+        - kind_cluster_api_ip_index | length > 0
+        - kind_cluster_api_ip_index | int >= 0
+      tags:
+        - clean
+        - install
+
+    - name: "Install cluster '{{ kind_cluster_name }}' with api address '{{ kind_cluster_api_server_address }}'"
       ansible.builtin.include_tasks:
         file: install.yml
       tags:
@@ -30,14 +41,9 @@
 
 - name: "Verify kind cluster"
   block:
-    - name: "Verify kind cluster"
-      kubernetes.core.k8s_cluster_info:
-      register: api_status
-
-    - name: "Failing when cluster is not running"
-      ansible.builtin.fail:
-        msg: "Kind cluster is not running !!!"
-      when: api_status.failed is undefined or api_status.failed|bool
+    - name: "Check cluster"
+      ansible.builtin.include_tasks:
+        file: verify_cluster.yml
 
     - name: "Pull index image '{{ kind_verify_index_image }}'"
       ansible.builtin.command: "{{ container_tool }} pull {{ kind_verify_index_image }}"
@@ -50,7 +56,6 @@
     - name: "Push index image to '{{ kind_verify_index_image_local }}'"
       ansible.builtin.command: "{{ container_tool }} push {{ kind_verify_index_image_local }}"
       changed_when: true
-
 
     - name: "Delete existing index pod"
       kubernetes.core.k8s:

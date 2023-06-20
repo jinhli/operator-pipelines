@@ -8,7 +8,7 @@ spec:
     - name: pipeline_image
     - name: podman_image
       description: Podman image
-      default: "registry.redhat.io/rhel8/podman:8.5-13"
+      default: "registry.redhat.io/rhel8/podman:8.7"
     - name: bundle_image
       description: Pull spec of a bundle image
     - name: from_index
@@ -38,22 +38,21 @@ spec:
       workingDir: $(workspaces.output.path)
       script: |
         #! /usr/bin/env bash
-        # This is needed to ensure the inspect-base-index step, which runs
-        # under a different UID, has access to its output file
-        truncate -s 0 podman-inspect.json
         chmod 664 podman-inspect.json
 
         mkdir -p $DOCKER_CONFIG
         chmod 775 $DOCKER_CONFIG
         cp $HOME/.docker/config.json $DOCKER_CONFIG/config.json
         chmod 664 $DOCKER_CONFIG/config.json
-        chmod go+rx .
 
     - name: inspect-base-index
       image: "$(params.podman_image)"
-      workingDir: $(workspaces.output.path)
+      env:
+        - name: STORAGE_DRIVER
+          value: vfs
       securityContext:
-        runAsUser: 1000
+        privileged: true
+      workingDir: $(workspaces.output.path)
       script: |
         #! /usr/bin/env bash
         set -exo pipefail
@@ -66,7 +65,6 @@ spec:
 
         podman pull $FROM_INDEX
         podman image inspect $FROM_INDEX | tee -a podman-inspect.json
-
     - name: determine-index-format
       image: "$(params.pipeline_image)"
       workingDir: $(workspaces.output.path)
@@ -74,7 +72,6 @@ spec:
         #! /usr/bin/env bash
         set -x
 
-        chmod 644 podman-inspect.json
         # Create a special file in the workspace if this index uses file-based configs
         CONFIGS_QUERY='.[0].Labels."operators.operatorframework.io.index.configs.v1"'
         jq -e "$CONFIGS_QUERY" podman-inspect.json && touch $FBC_FILE
@@ -125,7 +122,7 @@ spec:
           opm migrate index.db index
 
           # Generate the index Dockerfile
-          opm alpha generate dockerfile index
+          opm generate dockerfile index
 
           # Amend the Dockerfile with the addition of the sqlite DB for backwards compatibility
           echo -e "\nADD index.db $DB_PATH\n" >> index.Dockerfile
